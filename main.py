@@ -779,7 +779,7 @@ if source_file and master_file:
             st.download_button(
                 label="📥 点击下载填充完成的自动化总报表",
                 data=out_buf.getvalue(),
-                file_name=f"已自动填报_{original_master_name}",
+                file_name=original_master_name,
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
             )
 
