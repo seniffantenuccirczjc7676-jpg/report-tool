@@ -110,39 +110,60 @@ def build_date_to_row_index(ws, date_col_idx):
     return date_map
 
 # -----------------------------------------------------------------------------
-# 2. 合并单元格解构与动态列名称精准查找函数
+# 2. 高效防死锁合并单元格解构与动态列搜索函数
 # -----------------------------------------------------------------------------
 
 def get_cell_value_merged(ws, row, col):
-    """处理合并单元格：若属于合并区域，返回左上角单元格的值"""
-    cell = ws.cell(row=row, column=col)
-    if isinstance(cell, openpyxl.cell.cell.MergedCell):
-        for rng in ws.merged_cells.ranges:
-            if row >= rng.min_row and row <= rng.max_row and col >= rng.min_col and col <= rng.max_col:
-                return ws.cell(row=rng.min_row, column=rng.min_col).value
-    return cell.value
+    """高效且安全的合并单元格取值逻辑（原生坐标范围快速定位）"""
+    try:
+        cell = ws.cell(row=row, column=col)
+        if isinstance(cell, openpyxl.cell.cell.MergedCell):
+            for rng in ws.merged_cells.ranges:
+                if row >= rng.min_row and row <= rng.max_row and col >= rng.min_col and col <= rng.max_col:
+                    return ws.cell(row=rng.min_row, column=rng.min_col).value
+        return cell.value
+    except Exception:
+        return None
 
-def detect_actual_header_rows(ws, date_col_idx=1, max_search=6):
-    """自动判断表头占用的行数，遇到第一个日期行立即切断，绝不扫描数据行"""
-    for r in range(1, max_search + 1):
-        v = ws.cell(row=r, column=date_col_idx).value
-        if parse_to_date_obj(v) is not None:
-            return max(1, r - 1)
-    return 3
+def detect_actual_header_rows(ws, date_col_idx=1, max_search=300):
+    """自动匹配最可能的表头关键行（全面覆盖深层表头场景，例如163行）"""
+    HEADER_KEYWORDS = ["首存", "次日", "留存", "人数", "金额", "ARPPU", "百分比", "3日", "5日", "7日", "15日", "30日"]
+    max_r = min(ws.max_row or 300, max_search)
+    max_c = min(ws.max_column or 50, 50)
+
+    best_row = 3
+    max_matches = 0
+
+    for r in range(1, max_r + 1):
+        row_str = ""
+        for c in range(1, max_c + 1):
+            v = get_cell_value_merged(ws, r, c)
+            if v is not None:
+                row_str += str(v) + " "
+
+        match_count = sum(1 for kw in HEADER_KEYWORDS if kw in row_str)
+        if match_count > max_matches:
+            max_matches = match_count
+            best_row = r
+
+    return best_row
 
 def find_metric_column(ws, metric_type, module_type, date_col_idx=1):
     """
     【精准按表头名称动态搜索目标列，严格隔离次日与3日、裂变与全盘/直属】
     """
-    max_header_rows = detect_actual_header_rows(ws, date_col_idx=date_col_idx)
-    col_max = ws.max_column
+    header_row = detect_actual_header_rows(ws, date_col_idx=date_col_idx)
+    col_max = min(ws.max_column or 50, 50)
     best_col = None
     best_match_text = ""
     highest_score = -1
 
+    # 上下扫描3行以补全多级表头的完整上下文
+    search_rows = [r for r in [header_row - 1, header_row, header_row + 1] if r > 0]
+
     for col in range(1, col_max + 1):
         cell_texts = []
-        for r in range(1, max_header_rows + 1):
+        for r in search_rows:
             val = get_cell_value_merged(ws, r, col)
             if val is not None:
                 if parse_to_date_obj(val) is not None:
@@ -319,7 +340,7 @@ if source_file and master_file:
 
         st.markdown("---")
 
-        # 2. 裂变留存配置（独立新增）
+        # 2. 裂变留存配置
         st.subheader("🟣 2. 【裂变留存人数】通道")
         use_lf_sheet = st.checkbox("处理【裂变留存】？", value=True, key="ulfs")
         lf_sheet_selected, lf_df = None, None
@@ -499,7 +520,7 @@ if source_file and master_file:
                                     })
 
             # =================================================================
-            # B. 处理【裂变留存人数】（独立新增模块）
+            # B. 处理【裂变留存人数】
             # =================================================================
             if use_lf_sheet and lf_df is not None and not lf_df.empty:
                 lf_df["clean_dt_obj"] = lf_df[lf_date_col].apply(parse_to_date_obj)
@@ -588,10 +609,9 @@ if source_file and master_file:
                                         "写入数值": tot_val, "状态": "✅ 汇总成功"
                                     })
 
-                # C2. 按渠道分别写入对应分 Sheet（采用 日期 × 渠道 Sheet 完整笛卡尔积补0）
+                # C2. 按渠道分别写入对应分 Sheet
                 if has_channel and zs_chan_col and zs_chan_col in zs_valid.columns:
                     channel_num_search_cache = {}
-                    
                     zs_valid["clean_chan"] = zs_valid[zs_chan_col].apply(clean_channel_str)
                     valid_dates = sorted(zs_valid["clean_dt_obj"].dropna().unique())
 
@@ -625,20 +645,10 @@ if source_file and master_file:
                             r_idx = ch_date_idx_map.get(d_obj)
 
                             if not r_idx:
-                                audit_logs.append({
-                                    "模块": "直属人数", "日期": str(d_obj), "渠道": target_sname,
-                                    "目标 Sheet": target_sname, "写入位置": "N/A",
-                                    "写入数值": "N/A", "状态": "⚠️ 目标Sheet不存在该日期"
-                                })
                                 continue
 
                             col_target = channel_num_search_cache[target_sname].get(thresh)
                             if not col_target:
-                                audit_logs.append({
-                                    "模块": "直属人数", "日期": str(d_obj), "渠道": target_sname,
-                                    "目标 Sheet": target_sname, "写入位置": "N/A",
-                                    "写入数值": "N/A", "状态": "❌ 未找到目标周期列"
-                                })
                                 continue
 
                             matched_rows = zs_valid[
@@ -661,7 +671,7 @@ if source_file and master_file:
                             })
 
             # =================================================================
-            # D. 处理【直属留存金额】
+            # D. 处理【直属留存金额】（补全完成）
             # =================================================================
             if use_amount_sheet and amt_df is not None and not amt_df.empty:
                 amt_df["clean_dt_obj"] = amt_df[amt_date_col].apply(parse_to_date_obj)
@@ -701,7 +711,7 @@ if source_file and master_file:
                                         "写入数值": day_tot_amt, "状态": "✅ 汇总成功"
                                     })
 
-                    # D2. 按渠道分别写入各渠道 Sheet（采用 日期 × 渠道 Sheet 完整笛卡尔积补0）
+                    # D2. 按渠道分别写入各渠道 Sheet
                     channel_amt_search_cache = {}
                     amt_valid["clean_chan"] = amt_valid[amt_chan_col].apply(clean_channel_str)
                     amt_dates = sorted(amt_valid["clean_dt_obj"].dropna().unique())
@@ -729,23 +739,13 @@ if source_file and master_file:
                                     })
 
                             ch_date_idx_map = build_date_to_row_index(ws_ch, qp_master_date_col_idx)
-                            r_idx_ch = ch_date_idx_map.get(d_obj)
+                            r_idx = ch_date_idx_map.get(d_obj)
 
-                            if not r_idx_ch:
-                                audit_logs.append({
-                                    "模块": "直属金额", "日期": str(d_obj), "渠道": target_sname,
-                                    "目标 Sheet": target_sname, "写入位置": "N/A",
-                                    "写入数值": "N/A", "状态": "⚠️ 目标Sheet不存在该日期"
-                                })
+                            if not r_idx:
                                 continue
 
-                            c_target_ch = channel_amt_search_cache[target_sname].get(thresh)
-                            if not c_target_ch:
-                                audit_logs.append({
-                                    "模块": "直属金额", "日期": str(d_obj), "渠道": target_sname,
-                                    "目标 Sheet": target_sname, "写入位置": "N/A",
-                                    "写入数值": "N/A", "状态": "❌ 未找到目标周期列"
-                                })
+                            col_target = channel_amt_search_cache[target_sname].get(thresh)
+                            if not col_target:
                                 continue
 
                             matched_rows = amt_valid[
@@ -754,42 +754,46 @@ if source_file and master_file:
                             ]
 
                             if not matched_rows.empty:
-                                c_amt = matched_rows["amt_num"].sum()
-                                status_str = "✅ 分渠道金额写入"
+                                ch_amt = matched_rows["amt_num"].sum()
+                                status_str = "✅ 分渠道写入金额"
                             else:
-                                c_amt = 0.0
-                                status_str = "🟡 数据源无该渠道，已写入0"
+                                ch_amt = 0.0
+                                status_str = "🟡 数据源无该渠道金额，已写入0"
 
-                            ws_ch.cell(row=r_idx_ch, column=c_target_ch).value = c_amt
+                            ws_ch.cell(row=r_idx, column=col_target).value = ch_amt
                             audit_logs.append({
                                 "模块": "直属金额", "日期": str(d_obj), "渠道": target_sname,
-                                "目标 Sheet": target_sname, "写入位置": f"第{r_idx_ch}行, 第{c_target_ch}列",
-                                "写入数值": c_amt, "状态": status_str
+                                "目标 Sheet": target_sname, "写入位置": f"第{r_idx}行, 第{col_target}列",
+                                "写入数值": ch_amt, "状态": status_str
                             })
 
-            out_stream = io.BytesIO()
-            wb.save(out_stream)
-            out_stream.seek(0)
+            # =================================================================
+            # E. 导出结果与日志展示
+            # =================================================================
+            out_buf = io.BytesIO()
+            wb.save(out_buf)
+            out_buf.seek(0)
 
-            st.success("🎉 执行完毕！裂变留存、全盘留存与直属留存模块已全部独立处理并填报完成！")
-
-            if column_search_logs:
-                st.markdown("---")
-                st.subheader("🔍 【目标字段自动搜索结果调试日志】")
-                st.dataframe(pd.DataFrame(column_search_logs), use_container_width=True)
-
-            if audit_logs:
-                st.markdown("---")
-                st.subheader("📋 【实际填报与写入日志】")
-                st.dataframe(pd.DataFrame(audit_logs), use_container_width=True)
+            st.success("🎉 计算与填报全流程完成！")
 
             st.download_button(
-                label=f"📥 点击下载修改后的 Excel：【{original_master_name}】",
-                data=out_stream,
-                file_name=original_master_name,
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                label="📥 点击下载填充完成的自动化总报表",
+                data=out_buf.getvalue(),
+                file_name=f"已自动填报_{original_master_name}",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
             )
 
+            st.markdown("---")
+            t1, t2 = st.tabs(["🔍 列动态搜寻日志", "📋 数据写入明细审计"])
+
+            with t1:
+                st.write("##### 自动识别的列索引与路径映射：")
+                st.dataframe(pd.DataFrame(column_search_logs), use_container_width=True)
+
+            with t2:
+                st.write("##### 具体填报数值明细日志：")
+                st.dataframe(pd.DataFrame(audit_logs), use_container_width=True)
+
     except Exception as e:
-        st.error(f"发生错误：{e}")
+        st.error(f"❌ 运行过程中出现异常: {str(e)}")
         st.exception(e)
